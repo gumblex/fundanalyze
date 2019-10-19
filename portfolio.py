@@ -4,6 +4,7 @@
 
 import re
 import sys
+import numbers
 import sqlite3
 import collections
 
@@ -24,6 +25,73 @@ re_kind = re.compile('[A-C]$')
 
 def make_in(values):
     return '(%s)' % ','.join('?' * len(l))
+
+
+def portfolio_byvalue(
+    weights, steps, min_values, max_values=1e9, total_portfolio_value=10000
+):
+    """
+    For a long only portfolio, convert the continuous weights to a discrete
+    allocation using Mixed Integer Linear Programming. This function assumes
+    that we buy some asset based on value instead of shares, and there is a
+    limit of minimum value and increasing step.
+
+    :param weights: continuous weights generated from the ``efficient_frontier`` module
+    :type weights: dict
+    :param min_values: the minimum value for each asset
+    :type min_values: int/float or dict
+    :param max_values: the maximum value for each asset
+    :type max_values: int/float or dict
+    :param steps: the minimum value increase for each asset
+    :type steps: int/float or dict
+    :param total_portfolio_value: the desired total value of the portfolio, defaults to 10000
+    :type total_portfolio_value: int/float, optional
+    :raises TypeError: if ``weights`` is not a dict
+    :return: the number of value of each ticker that should be purchased,
+             along with the amount of funds leftover.
+    :rtype: (dict, float)
+    """
+    import pulp
+
+    if not isinstance(weights, dict):
+        raise TypeError("weights should be a dictionary of {ticker: weight}")
+    if total_portfolio_value <= 0:
+        raise ValueError("total_portfolio_value must be greater than zero")
+
+    if isinstance(steps, numbers.Real):
+        steps = {k: steps for k in weights}
+    if isinstance(min_values, numbers.Real):
+        min_values = {k: min_values for k in weights}
+    if isinstance(max_values, numbers.Real):
+        max_values = {k: max_values for k in weights}
+
+    m = pulp.LpProblem("PfAlloc", pulp.LpMinimize)
+    vals = {}
+    realvals = {}
+    usevals = {}
+    etas = {}
+    abss = {}
+    remaining = pulp.LpVariable("remaining", 0)
+    for k, w in weights.items():
+        if steps.get(k):
+            vals[k] = pulp.LpVariable("x_%s" % k, 0, cat="Integer")
+            realvals[k] = steps[k] * vals[k]
+            etas[k] = w * total_portfolio_value - realvals[k]
+        else:
+            realvals[k] = vals[k] = pulp.LpVariable("x_%s" % k, 0)
+            etas[k] = w * total_portfolio_value - vals[k]
+        abss[k] = pulp.LpVariable("u_%s" % k, 0)
+        usevals[k] = pulp.LpVariable("b_%s" % k, cat="Binary")
+        m += etas[k] <= abss[k]
+        m += -etas[k] <= abss[k]
+        m += realvals[k] >= usevals[k] * min_values.get(k, steps.get(k, 0))
+        m += realvals[k] <= usevals[k] * max_values.get(k, 1e18)
+    m += remaining == total_portfolio_value - pulp.lpSum(realvals.values())
+    m += pulp.lpSum(abss.values()) + remaining
+    m.solve()
+    results = {k: pulp.value(val) for k, val in realvals.items()}
+    return results, remaining.varValue
+
 
 class FundPortfolio:
 
@@ -123,7 +191,7 @@ class FundPortfolio:
     def evaluate(self, func):
         df_train = self.df[:-self.testdays]
         df_test = self.df[-self.testdays:]
-        df_test_ret = (pypfopt.expected_returns.daily_price_returns(df_test)
+        df_test_ret = (pypfopt.expected_returns.returns_from_prices(df_test)
             + 1).product() # / testdays * 252
         weights = func(df_train)
         alloc, rem, realweights = self.postprocess(weights)
@@ -150,11 +218,12 @@ class FundPortfolio:
         return ef.min_volatility()
 
     def opt_hrp(self, df):
-        returns = pypfopt.expected_returns.daily_price_returns(df)
-        return pypfopt.hierarchical_risk_parity.hrp_portfolio(returns)
+        returns = pypfopt.expected_returns.returns_from_prices(df)
+        hrp = pypfopt.hierarchical_risk_parity.HRPOpt(returns)
+        return hrp.hrp_portfolio()
 
     def postprocess(self, weights):
-        alloc, rem = pypfopt.discrete_allocation.portfolio_byvalue(
+        alloc, rem = portfolio_byvalue(
             weights, 1, self.minvalues, 1e9, self.totalval)
         return alloc, rem, {k: w / (self.totalval - rem) for k, w in alloc.items()}
 

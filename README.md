@@ -4,6 +4,9 @@ Analyze and make a portfolio of funds.
 ## Dependencies
 
 * bs4
+* pulp
+* numpy
+* pandas
 * PyPortfolioOpt
 
 ## Usage
